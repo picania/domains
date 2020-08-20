@@ -1,0 +1,5 @@
+.gitattributes        text eol=lf
+.gitignore            text eol=lf
+Cargo.*               text eol=lf
+*.rs                  text eol=lf
+/.idea/workspace.xml  text eol=lf 
