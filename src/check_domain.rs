@@ -4,24 +4,21 @@ use std::cmp::max;
 use flate2::read::GzDecoder;
 use trust_dns_resolver::Resolver;
 use trust_dns_resolver::config::*;
-use std::net::{IpAddr, Ipv4Addr};
-use std::str::FromStr;
+use std::net::IpAddr;
 
 const DECOMPRESS_SIZE: usize = 400 * 1024 * 1024; // 400 Mb
 
-// корневые сервера России
-// f.root (Москва — 2 шт.);
-// i.root (Санкт-Петербург);
-// j.root (Москва, Санкт-Петербург);
-// k.root (Москва, Санкт-Петербург, Новосибирск);
-// l.root (Москва, Ростов-на-Дону, Екатеринбург).
-// корневой DNS в Новосибирске
-// IPv4	193.0.14.129
-const NOVOSIBIRSK: &str = "193.0.14.129";
+const E_ROOT_V4: [u8; 4] = [192, 203, 230, 10];
+// E IPv6	2001:500:a8::e
+const F_ROOT_V4: [u8; 4] = [192, 5, 5, 241];
+// F IPv6	2001:500:2f::f
+const J_ROOT_V4: [u8; 4] = [192, 58, 128, 30];
+// J IPv6	2001:503:c27::2:30
+const I_ROOT_V4: [u8; 4] = [192, 36, 148, 17];
+// I IPv6	2001:7fe::53
+const K_ROOT_V4: [u8; 4] = [193, 0, 14, 129];
 // IPv6	2001:7fd::1
-// корневой DNS в Екатеринбурге
-// IPv4	199.7.83.42
-const EKATERINBURG: &str = "199.7.83.42";
+const L_ROOT_V4: [u8; 4]= [199, 7, 83, 42];
 // IPv6	2001:500:9f::42
 
 fn main() {
@@ -50,10 +47,19 @@ fn main() {
     let mut domains_count = 0usize;
 
     // создаем резолвер для DNS
-    let root1 = IpAddr::V4(Ipv4Addr::from_str(NOVOSIBIRSK).unwrap());
-    let root2 = IpAddr::V4(Ipv4Addr::from_str(EKATERINBURG).unwrap());
-    let group = NameServerConfigGroup::from_ips_clear(&[root1, root2], 53);
-    let mut config = ResolverConfig::from_parts(None, vec![], group);
+    let ips = [
+        // IpAddr::V4(E_ROOT_V4.into()),
+        // IpAddr::V4(F_ROOT_V4.into()),
+        // IpAddr::V4(J_ROOT_V4.into()),
+        // IpAddr::V4(I_ROOT_V4.into()),
+        // IpAddr::V4(K_ROOT_V4.into()),
+        // IpAddr::V4(L_ROOT_V4.into()),
+        IpAddr::V4([192, 168, 1, 1].into()),
+    ];
+    // let mut group = NameServerConfigGroup::from_ips_clear(&ips, 53);
+    // group.merge(NameServerConfigGroup::google());
+    let group = NameServerConfigGroup::google();
+    let config = ResolverConfig::from_parts(None, vec![], group);
     let resolver = Resolver::new(config, ResolverOpts::default()).unwrap();
 
     reader.lines()
@@ -66,7 +72,7 @@ fn main() {
             let bytes = domain.len();
             max_domain = max(max_domain, bytes);
             writer.write_all(domain.as_bytes()).unwrap();
-            writer.write_all("\n".as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
             domains_count += 1;
 
             // разрешаем доменное имя в адрес
