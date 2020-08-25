@@ -1,13 +1,11 @@
-use std::fs::File;
-use std::io::{Read, BufReader, BufRead, BufWriter, Write};
-use std::cmp::max;
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufRead, BufWriter, Write};
 use flate2::read::GzDecoder;
 use trust_dns_resolver::Resolver;
 use trust_dns_resolver::config::*;
 use std::net::IpAddr;
 
-const DECOMPRESS_SIZE: usize = 400 * 1024 * 1024; // 400 Mb
-
+// Root servers located in Russian Federation
 const E_ROOT_V4: [u8; 4] = [192, 203, 230, 10];
 // E IPv6	2001:500:a8::e
 const F_ROOT_V4: [u8; 4] = [192, 5, 5, 241];
@@ -21,81 +19,90 @@ const K_ROOT_V4: [u8; 4] = [193, 0, 14, 129];
 const L_ROOT_V4: [u8; 4]= [199, 7, 83, 42];
 // IPv6	2001:500:9f::42
 
-fn main() {
-    // загружаем архив в память
-    let mut file = File::open("zones/ru_domains.gz").unwrap();
-    let file_len = file.metadata().unwrap().len() as usize;
-    let mut gz_buffer = Vec::<u8>::with_capacity(file_len);
-
-    let total = file.read_to_end(&mut gz_buffer).unwrap();
-    println!("Archived size: {}", total);
-
-    // распаковываем архив в буфер
-    let mut dec = GzDecoder::new(gz_buffer.as_slice());
-    let mut out_buffer = String::with_capacity(DECOMPRESS_SIZE);
-
-    let unpacked = dec.read_to_string(&mut out_buffer).unwrap();
-    println!("Unpacked size: {}", unpacked);
-
-    // читаем из буфера построчно
-    let reader = BufReader::new(out_buffer.as_bytes());
-
-    let out = File::create("zones/ru_domains.txt").unwrap();
-    let mut writer = BufWriter::new(out);
-
-    let mut max_domain = 0usize;
-    let mut domains_count = 0usize;
-
-    // создаем резолвер для DNS
+fn create_resolver() -> io::Result<Resolver> {
     let ips = [
-        // IpAddr::V4(E_ROOT_V4.into()),
-        // IpAddr::V4(F_ROOT_V4.into()),
-        // IpAddr::V4(J_ROOT_V4.into()),
-        // IpAddr::V4(I_ROOT_V4.into()),
-        // IpAddr::V4(K_ROOT_V4.into()),
-        // IpAddr::V4(L_ROOT_V4.into()),
-        IpAddr::V4([192, 168, 1, 1].into()),
+        IpAddr::V4(E_ROOT_V4.into()),
+        IpAddr::V4(F_ROOT_V4.into()),
+        IpAddr::V4(J_ROOT_V4.into()),
+        IpAddr::V4(I_ROOT_V4.into()),
+        IpAddr::V4(K_ROOT_V4.into()),
+        IpAddr::V4(L_ROOT_V4.into()),
     ];
-    // let mut group = NameServerConfigGroup::from_ips_clear(&ips, 53);
-    // group.merge(NameServerConfigGroup::google());
-    let group = NameServerConfigGroup::google();
+    let group = NameServerConfigGroup::from_ips_clear(&ips, 53);
+    let mut options = ResolverOpts::default();
+    options.ip_strategy = LookupIpStrategy::Ipv4Only;
+    options.attempts = ips.len();
+    options.rotate = true;
     let config = ResolverConfig::from_parts(None, vec![], group);
-    let resolver = Resolver::new(config, ResolverOpts::default()).unwrap();
+
+    Resolver::new(config, options)
+}
+
+fn extract_domains(from: &str, to: &str) -> io::Result<()> {
+    let input = File::open(from)?;
+    let output = File::create(to)?;
+    let decoder = GzDecoder::new(input);
+    let reader = BufReader::new(decoder);
+    let mut writer= BufWriter::new(output);
 
     reader.lines()
         .filter_map(|x| x.ok())
         .map(|s| {
-            s.chars().take_while(|x| !x.is_ascii_whitespace()).collect::<String>()
+            s.split_ascii_whitespace().take(1).collect::<String>()
         })
-        .take(1000)
         .for_each(|domain| {
-            let bytes = domain.len();
-            max_domain = max(max_domain, bytes);
-            writer.write_all(domain.as_bytes()).unwrap();
-            writer.write_all(b"\n").unwrap();
-            domains_count += 1;
-
-            // разрешаем доменное имя в адрес
-            print!("Resolve DNS for '{}' ... ", domain);
-            std::io::stdout().flush().unwrap();
-            match resolver.lookup_ip(&domain) {
-                Ok(ips) => {
-                    let addr_count = ips.iter().count();
-                    println!("Found {} ip-addresses", addr_count);
-                    if addr_count > 0 {
-                        print!("IP-addr for '{}':        ", domain);
-                        for x in ips {
-                            print!("{} ", x.to_string());
-                        }
-                        println!();
-                    }
-                },
-                Err(e) => println!("{}", e),
-            }
-
-            //println!("{}", x);
+            writer.write_fmt(format_args!("{}\n", domain)).unwrap();
         });
 
-    println!("Domains: {}", domains_count);
-    println!("Max domain name: {}", max_domain);
+    Ok(())
+}
+
+fn resolve_domains(unresolved: &str, resolved: &str) -> io::Result<()> {
+    let resolver = create_resolver()?;
+    let input = File::open(unresolved)?;
+    let output = File::create(resolved)?;
+    let reader = BufReader::new(input);
+    let mut writer = BufWriter::new(output);
+    let mut unr_writer = BufWriter::new(File::create("zones/unresolved.ru.tmp")?);
+
+    reader.lines()
+        .filter_map(|x| x.ok())
+        .take(1000)
+        .for_each(|domain| {
+            match resolver.lookup_ip(&domain) {
+                Ok(ips) => {
+                    writer.write_all(domain.as_bytes()).unwrap();
+                    print!("{}", &domain);
+                    for ip in ips {
+                        writer.write_fmt(format_args!(" {}", &ip)).unwrap();
+                        print!(" {}", &ip);
+                    }
+                    writer.write_all(b"\n").unwrap();
+                    println!();
+                    io::stdout().flush().unwrap();
+                },
+                Err(_) => {
+                    unr_writer.write_fmt(format_args!("{}\n", domain)).unwrap();
+                },
+            }
+        });
+
+    fs::copy("zones/unresolved.ru.tmp", "zones/unresolved.ru")?;
+    fs::remove_file("zones/unresolved.ru.tmp")?;
+
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    loop {
+        if fs::metadata("zones/unresolved.ru").is_ok() {
+            resolve_domains("zones/unresolved.ru", "zones/resolved.ru")?;
+            break;
+        } else {
+            extract_domains("zones/ru_domains.gz", "zones/domains.ru")?;
+            fs::copy("zones/domains.ru", "zones/unresolved.ru")?;
+        }
+    }
+
+    Ok(())
 }
