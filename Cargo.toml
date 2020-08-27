@@ -7,14 +7,18 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-reqwest = { version = "0.10.7", features =["blocking"]}
-flate2 = {version = "1.0.17"}
+reqwest = { version = "0.10.7", features = ["blocking"] }
+flate2 = { version = "1.0.17" }
 trust-dns-resolver = "0.19.5"
 scraper = "0.12.0"
+mongodb = "0.9.2"
+bson = "0.14.0"
+pretty_env_logger = "0.4.0"
+log = "0.4.11"
 
 [[bin]]
-name = "get_zones"
-path = "src/get_zones.rs"
+name = "update_zones"
+path = "src/update_zones.rs"
 
 [[bin]]
 name = "check_domain"
