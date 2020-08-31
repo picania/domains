@@ -47,7 +47,7 @@ where
     P: AsRef<Path>,
 {
     info!("Connect to '{}' database ...", base);
-    let client = mongodb::Client::with_uri_str(MONGODB)?;
+    let client = mongodb::sync::Client::with_uri_str(MONGODB)?;
     let database = client.database(base);
     let domains = database.collection(collections::DOMAINS);
     let reader = BufReader::new(GzDecoder::new(File::open(path)?));
