@@ -11,10 +11,15 @@ reqwest = { version = "0.10.8", features = ["blocking"] }
 flate2 = { version = "1.0.17" }
 trust-dns-resolver = "0.19.5"
 scraper = "0.12.0"
-mongodb = { version = "1.1.0", features = ["sync"], default-features = false }
+mongodb = { version = "1.1.0", features = ["sync"] }
 bson = "1.1.0"
 pretty_env_logger = "0.4.0"
 log = "0.4.11"
+tokio = { version = "0.2.25", features = ["full"] }
+futures = "0.3.14"
+#itertools = "0.10.0"
+serde = "1.0.125"
+#punycode = "0.4.1"
 
 [[bin]]
 name = "update_zones"
@@ -22,8 +27,12 @@ path = "src/update_zones.rs"
 
 [[bin]]
 name = "check_domain"
-path = "src/check_domain.rs"
+path = "src/resolve_domains.rs"
 
 [[bin]]
 name = "lookup_site"
 path = "src/lookup_site.rs"
+
+[[bin]]
+name = "download_zones"
+path = "src/download_zones.rs"

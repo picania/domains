@@ -1,180 +1,152 @@
-use reqwest::blocking::Response;
+use reqwest::Response;
 use reqwest::StatusCode;
-use reqwest::Result;
 use scraper::Html;
-use scraper::Selector;
+use log::{error, info, warn};
+use bson::Document;
+use serde::{Deserialize, Serialize};
+use futures::stream::StreamExt;
+use ::zones::Site;
+use ::zones::parse_title;
+use ::zones::parse_metadata;
+use mongodb::Collection;
+use std::time::Duration;
 
-// 1. берем доменное имя
-// 2. проверяем наличие сайта на 80 порту
-// 3. проверяем наличие сайта на 443 порту
-// 4. по редиректам не переходим, отлавливаем адрес перенаправления
-// 5. если сайт есть, получаем стартовую страницу
-// 6. из стартовой страницы выбираем заголовок и метаинформацию
-// 7. метаинформацию разбираем на составляющие
-// 8. сохраняем последний обработанный сайт, чтобы продолжить в случае поломок
-// 9. сохраняем полученную информацию
+// 1. Берем из базы 10 непроверенных доменных имен. Допустим, проверенные будут обозначаться полем "lookup": true.
+// 2. Стучимся по адресу по протоколам http и https.
+// 3. По каждому протоколу записываем url откуда пришел ответ. Это поможет отследить перенаправления.
+// 4. Если сервер ответил, то из стартовой страницы выбираем заголовок и метаинформацию
+// 5. Метаинформацию разбираем на составляющие
+// 6. Сохраняем полученную информацию с отметкой lookup
 
-struct Meta {
-    charset: Option<String>,
-    description: Option<String>,
-    keywords: Option<String>,
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Domain {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    redirect: Option<Site>,
+    #[serde(default)]
+    http: Option<Site>,
+    #[serde(default)]
+    https: Option<Site>,
+    #[serde(default)]
+    lookup: bool,
 }
 
-fn parse_title(doc: &Html) -> Option<String> {
-    let tag = Selector::parse("title").unwrap();
-
-    doc.select(&tag)
-        .map(|x| {
-            x.text().collect::<String>()
-        })
-        .next()
-}
-
-fn parse_metadata(doc: &Html) -> Meta {
-    let meta = Selector::parse("meta").unwrap();
-    let mut metadata = Meta{keywords: None, description: None, charset: None};
-
-    for tag in doc.select(&meta) {
-        if let Some(charset) = tag.value().attr("charset") {
-            metadata.charset = Some(charset.into());
-        }
-
-        if let Some(name) = tag.value().attr("name") {
-            if let Some(content) = tag.value().attr("content") {
-                if name.eq_ignore_ascii_case("description") {
-                    metadata.description = Some(content.into());
-                }
-
-                if name.eq_ignore_ascii_case("keywords") {
-                    metadata.keywords = Some(content.into());
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    metadata
-}
-
-fn dispatch(response: Response) {
-    let url: String = response.url().as_str().into();
-
+async fn dispatch(response: Response) {
     match response.status() {
         StatusCode::OK => {
-            if let Ok(text) = response.text() {
+            if let Ok(text) = response.text().await {
                 let doc = Html::parse_document(&text);
-                let title = parse_title(&doc);
-                let meta = parse_metadata(&doc);
+                let mut site = parse_metadata(&doc);
+                site.title = parse_title(&doc);
 
-                print!("{} ", url);
-                title.map_or_else(|| {}, |s| println!("title: {}", s));
-                meta.keywords.map_or_else(|| {}, |s| println!("keywords: {}", s));
-                meta.description.map_or_else(|| {}, |s| println!("description: {}", s));
-                meta.charset.map_or_else(|| {}, |s| println!("charset: {}", s));
+                info!("{:?}", site);
             }
         },
-        code if code.as_u16() >= 300 && code.as_u16() < 400 => {
-            let location = response.headers().get("Location").unwrap();
-            println!("{} Redirect code: {} {}", url, code, location.to_str().unwrap());
-        },
-        code if code.as_u16() >= 400 && code.as_u16() < 500 => {
-            println!("{} Client side error: {}", url, code);
-        },
-        code if code.as_u16() >= 500 && code.as_u16() < 600 => {
-            println!("{} Server side error: {}", url, code);
-        },
-        code => {
-            println!("{} Information: {}", url, code);
+        _ => warn!("Get response with code: {}", response.status().as_u16()),
+        // code if code >= StatusCode::MULTIPLE_CHOICES && code < StatusCode::BAD_REQUEST => {
+        //     let location = response.headers().get("Location").unwrap();
+        //     info!("Redirect: {} {}", code, location.to_str().unwrap());
+        // },
+        // code if code >= StatusCode::BAD_REQUEST && code < StatusCode::INTERNAL_SERVER_ERROR => {
+        //     info!("Client side error: {}", code);
+        // },
+        // code if code >= StatusCode::INTERNAL_SERVER_ERROR && code <= StatusCode::NETWORK_AUTHENTICATION_REQUIRED => {
+        //     info!("Server side error: {}", code);
+        // },
+        // code => {
+        //     info!("Information: {}", code);
+        // }
+    }
+}
+
+type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn error_dispatch(proto: &str, err: reqwest::Error) {
+    if err.is_request() {
+        error!("{} -- FAILED -- Error sending request", proto);
+    }
+
+    if err.is_timeout() {
+        error!("{} -- FAILED -- Time out", proto);
+    }
+
+    if err.is_status() {
+        error!("{} -- FAILED -- Http {} error", proto, err.status().unwrap().as_u16());
+    }
+}
+
+fn lookup_domain(proto: &str, domain: &Domain) {
+    info!("Look up domain {}\n{:#?}", &format!("{}/{}", proto, domain.url), domain);
+}
+
+async fn batch_requests(coll: Collection) {
+    const BATCH_SIZE: usize = 10; // Не более 10 запросов в секунду
+    let timer = tokio::time::delay_for(Duration::from_secs(1));
+
+    let records = coll.find(None, None).await;
+
+    match records {
+        Ok(cursor) => {
+            cursor.take(BATCH_SIZE)
+                .filter_map(|x| {
+                    async { x.ok() }
+                })
+                .filter_map(|doc: Document| {
+                    async move {
+                        bson::from_bson::<Domain>(bson::Bson::Document(doc)).ok()
+                    }
+                })
+                .for_each(|domain| {
+                    async move {
+                        //info!("Connect to '{}' server ...", domain.url);
+                        let http = "http://";
+                        let https = "https://";
+
+                        lookup_domain(http, &domain);
+                        lookup_domain(https, &domain);
+                        // match reqwest::get(&format!("{}{}", http, &domain.url)).await {
+                        //     Ok(response) => dispatch(response).await,
+                        //     Err(err) => error_dispatch(http, err),
+                        // }
+                        //
+                        // match reqwest::get(&format!("{}{}", https, &domain.url)).await {
+                        //     Ok(response) => dispatch(response).await,
+                        //     Err(err) => error_dispatch(https, err),
+                        // }
+                    }
+                }).await;
+        }
+        Err(err) => {
+            error!("{}", err);
         }
     }
+
+    timer.await;
 }
 
-fn main() -> Result<()> {
-    let domain = "mvideo.ru";
+async fn lookup_sites(client: mongodb::Client, db: &str) {
+    let db = client.database(db);
+    let coll = db.collection("domains");
 
-    match reqwest::blocking::get(format!("https://{}", domain).as_str()) {
-        Ok(response) => dispatch(response),
-        Err(e) => eprintln!("{} {}", domain, e),
-    }
+    batch_requests(coll).await;
+}
+
+#[tokio::main(core_threads=4)]
+async fn main() -> BoxResult<()> {
+    pretty_env_logger::init_timed();
+
+    let uri = std::env::var("MONGODB_URI").map_err(|x|{
+        error!("You must set MONGODB_URI environment variable");
+        x
+    })?;
+    let client = mongodb::Client::with_uri_str(&uri).await?;
+
+    let ru = tokio::spawn(lookup_sites(client.clone(), "ru_zone"));
+    let su = tokio::spawn(lookup_sites(client.clone(), "su_zone"));
+    let rf = tokio::spawn(lookup_sites(client.clone(), "rf_zone"));
+
+    let (r1, r2, r3) = tokio::join!(ru, su, rf);
 
     Ok(())
-}
-
-#[cfg(test)]
-mod test {
-    use scraper::Html;
-    use crate::{parse_title, parse_metadata};
-
-    #[test]
-    fn title_exists() {
-        let html = r#"
-        <html>
-            <head>
-                <title>Title</title>
-            </head>
-            <body/>
-        </html>
-        "#;
-        let doc = Html::parse_document(html);
-
-        let title = parse_title(&doc);
-
-        assert_eq!(Some(String::from("Title")), title);
-    }
-
-    #[test]
-    fn title_not_exists() {
-        let html = r#"
-        <html>
-            <head/>
-            <body/>
-        </html>
-        "#;
-        let doc = Html::parse_document(html);
-
-        let title = parse_title(&doc);
-
-        assert_eq!(None, title);
-    }
-
-    #[test]
-    fn meta_not_exists() {
-        let html = r#"
-        <html>
-            <head/>
-            <body/>
-        </html>
-        "#;
-        let doc = Html::parse_document(html);
-
-        let metadata = parse_metadata(&doc);
-
-        assert_eq!(None, metadata.charset);
-        assert_eq!(None, metadata.description);
-        assert_eq!(None, metadata.keywords);
-    }
-
-    #[test]
-    fn meta_exists() {
-        let html = r#"
-        <html>
-            <head>
-                <meta charset="utf-8">
-                <meta name="description" content="description">
-                <meta name="keywords" content="keywords">
-                <meta name="description" content="description">
-                <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-            </head>
-            <body/>
-        </html>
-        "#;
-        let doc = Html::parse_document(html);
-
-        let metadata = parse_metadata(&doc);
-
-        assert_eq!(Some(String::from("utf-8")), metadata.charset);
-        assert_eq!(Some(String::from("description")), metadata.description);
-        assert_eq!(Some(String::from("keywords")), metadata.keywords);
-    }
 }

@@ -1,106 +1,105 @@
-#![allow(dead_code)]
-
-use reqwest::{blocking, IntoUrl, Url};
-use std::fs::File;
-use std::io::{self, BufWriter, BufReader, BufRead};
-use std::path::Path;
-use std::fmt::Display;
-use std::str::FromStr;
-use bson::doc;
+use ::zones::symmetric_diff;
+use bson::{doc, Document};
 use flate2::read::GzDecoder;
-use log::{info, error};
+use log::{error, info};
+use mongodb::options::FindOptions;
+use mongodb::sync::{Client, Collection};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 type BoxResult<T, E = Box<dyn std::error::Error>> = Result<T, E>;
 
-fn download_database<U, P>(url: U, path: P) -> BoxResult<()>
-where
-    U: IntoUrl + Display,
-    P: AsRef<Path>,
-{
-    info!("Start download {} ... ", url);
-    let mut response = blocking::get(url)?;
-
-    response.content_length().map_or_else(|| {}, |x| info!("Content {} bytes length.", x));
-
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-
-    let bytes = io::copy(&mut response, &mut writer)?;
-
-    info!("Download {} bytes", bytes);
-
-    Ok(())
-}
-
-mod collections {
-    pub const DOMAINS: &str = "domains";
-    pub const UNRESOLVED: &str = "unresolved";
-    pub const RESOLVED: &str = "resolved";
-    pub const WITH_ERRORS: &str = "with_errors";
-}
-
-const MONGODB: &str = "mongodb://192.168.1.137";
+const DOMAINS: &str = "domains";
+const REMOVED: &str = "removed";
+const FIND_KEY: &str = "url";
 const MONGODB_CHUNK_SIZE: usize = 100_000;
 
-fn update_database<P>(base: &str, path: P) -> BoxResult<()>
+fn update_database<P>(client: &Client, base: &str, path: P) -> BoxResult<()>
 where
     P: AsRef<Path>,
 {
     info!("Connect to '{}' database ...", base);
-    let client = mongodb::sync::Client::with_uri_str(MONGODB)?;
-    let database = client.database(base);
-    let domains = database.collection(collections::DOMAINS);
+
+    let db = client.database(base);
+    let coll = db.collection(DOMAINS);
     let reader = BufReader::new(GzDecoder::new(File::open(path)?));
 
-    // сбрасываем коллекцию
-    info!("Reset '{}' collection ...", collections::DOMAINS);
-    if let Err(e) = domains.drop(None) {
-        error!("{}", e);
-    }
-    let domains = database.collection(collections::DOMAINS);
-
-    info!("Prepare documents ...");
-    let docs = reader.lines()
-        .filter_map(|x| x.ok())
-        .map(|s| {
-            s.split_ascii_whitespace().take(1).collect::<String>()
-        })
-        .map(|domain| {
-            doc!{"url": domain}
-        })
-        .collect::<Vec<_>>();
-
-    info!("Insert documents ...");
-    let mut records = 0 as usize;
-    docs.into_iter().as_slice().chunks(MONGODB_CHUNK_SIZE)
-        .for_each(|chunk| {
-            match domains.insert_many(chunk.to_vec(), None) {
-                Ok(res) => {
-                    records += res.inserted_ids.len();
-                },
-                Err(e) => {
-                    error!("{}", e);
-                }
-            }
+    // Получаем курсор на коллекцию в базе данных. Сортируем выдачу по полю 'url' по алфавиту.
+    let options = FindOptions::builder()
+        .sort(Some(doc! {FIND_KEY: 1}))
+        .build();
+    let records = coll
+        .find(None, Some(options))?
+        .filter_map(Result::ok)
+        .map(|doc: Document| {
+            doc.iter()
+                .filter(|(key, _)| **key == FIND_KEY)
+                .filter_map(|(_, value)| value.as_str())
+                .collect::<String>()
         });
 
-    info!("Inserted {} records into {}", records, base);
+    // Получаем итератор на строки в файле. Строки в файле уже отсортированы по алфавиту.
+    let registry = reader.lines().filter_map(Result::ok).map(|s: String| {
+        s.split_ascii_whitespace()
+            .take(1)
+            .next()
+            .unwrap()
+            .to_string()
+    });
+
+    let (added, removed) = symmetric_diff(registry, records);
+
+    upload_records(&coll, &added);
+    update_removed_records(&coll, &removed);
 
     Ok(())
+}
+
+fn update_removed_records(coll: &Collection, domains: &[String]) {
+    let update = doc! {"$set": {REMOVED: true}};
+    let mut updated = 0;
+
+    domains.iter().for_each(|domain| {
+        let query = doc! {FIND_KEY: domain};
+
+        let result = coll.update_one(query, update.clone(), None);
+
+        if let Ok(result) = result {
+            updated += result.modified_count;
+        }
+    });
+
+    info!("Updated {} domains", updated);
+}
+
+fn upload_records(coll: &Collection, domains: &[String]) {
+    let mut added = 0;
+
+    domains.chunks(MONGODB_CHUNK_SIZE).for_each(|domains| {
+        let docs = domains
+            .iter()
+            .map(|domain| doc! {FIND_KEY: domain})
+            .collect::<Vec<_>>();
+
+        let result = coll.insert_many(docs, None);
+
+        if let Ok(result) = result {
+            added += result.inserted_ids.len();
+        }
+    });
+
+    info!("Added {} domains", added);
 }
 
 fn main() -> BoxResult<()> {
     pretty_env_logger::init_timed();
 
-    let urls = vec![
-        (Url::from_str("https://ru-tld.ru/files/RU_Domains_ru-tld.ru.gz")?, Path::new("zones/ru_domains.gz")),
-        (Url::from_str("https://ru-tld.ru/files/SU_Domains_ru-tld.ru.gz")?, Path::new("zones/su_domains.gz")),
-        (Url::from_str("https://ru-tld.ru/files/RF_Domains_ru-tld.ru.gz")?, Path::new("zones/rf_domains.gz")),
-    ];
-
-    for (url, path) in urls {
-        download_database(url, path)?;
-    }
+    let uri = std::env::var("MONGODB_URI").map_err(|x|{
+        error!("You must set MONGODB_URI environment variable");
+        x
+    })?;
+    let client = mongodb::sync::Client::with_uri_str(&uri)?;
 
     let bases = vec![
         ("ru_zone", Path::new("zones/ru_domains.gz")),
@@ -108,8 +107,8 @@ fn main() -> BoxResult<()> {
         ("rf_zone", Path::new("zones/rf_domains.gz")),
     ];
 
-    for (base, path) in bases {
-        update_database(base, path)?;
+    for (base, path) in &bases {
+        update_database(&client, base, path)?;
     }
 
     Ok(())
