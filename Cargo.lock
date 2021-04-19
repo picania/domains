@@ -1229,10 +1229,8 @@ dependencies = [
  "pbkdf2",
  "percent-encoding",
  "rand",
- "reqwest",
  "rustls",
  "serde",
- "serde_bytes",
  "serde_with",
  "sha-1",
  "sha2",
@@ -1759,7 +1757,6 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite 0.1.7",
  "serde",
- "serde_json",
  "serde_urlencoded",
  "tokio",
  "tokio-tls",
@@ -1923,15 +1920,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "558dc50e1a5a5fa7112ca2ce4effcb321b0300c0d4ccf0776a9f60cd89031171"
 dependencies = [
  "serde_derive",
-]
-
-[[package]]
-name = "serde_bytes"
-version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16ae07dd2f88a366f15bd0632ba725227018c69a1c8550a927324f8eb8368bb9"
-dependencies = [
- "serde",
 ]
 
 [[package]]

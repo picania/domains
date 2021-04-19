@@ -1,152 +1,284 @@
+use ::zones::parse_metadata;
+use ::zones::parse_title;
+use ::zones::Site;
+use bson::{doc, Document};
+use log::{error, info, warn};
+use mongodb::options::FindOptions;
 use reqwest::Response;
 use reqwest::StatusCode;
 use scraper::Html;
-use log::{error, info, warn};
-use bson::Document;
 use serde::{Deserialize, Serialize};
-use futures::stream::StreamExt;
-use ::zones::Site;
-use ::zones::parse_title;
-use ::zones::parse_metadata;
-use mongodb::Collection;
 use std::time::Duration;
+use std::fmt::{Display, Formatter};
 
-// 1. Берем из базы 10 непроверенных доменных имен. Допустим, проверенные будут обозначаться полем "lookup": true.
+const HTTP: &str = "http://";
+const HTTPS: &str = "https://";
+
+type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// 1. Берем из базы 1 доменное имя без поля "lookup".
 // 2. Стучимся по адресу по протоколам http и https.
-// 3. По каждому протоколу записываем url откуда пришел ответ. Это поможет отследить перенаправления.
-// 4. Если сервер ответил, то из стартовой страницы выбираем заголовок и метаинформацию
-// 5. Метаинформацию разбираем на составляющие
-// 6. Сохраняем полученную информацию с отметкой lookup
+// 3. По каждому протоколу записываем ответ: url, title, charset, description, keywords.
+// 4. Сохраняем полученную информацию с отметкой lookup: true, success: true.
+// 5. Если веб сервера на доменном имени нет, то отмечаем в базе lookup: true, success: false.
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Domain {
     #[serde(default)]
     url: String,
     #[serde(default)]
-    redirect: Option<Site>,
-    #[serde(default)]
     http: Option<Site>,
     #[serde(default)]
     https: Option<Site>,
     #[serde(default)]
     lookup: bool,
+    #[serde(default)]
+    success: bool,
 }
 
-async fn dispatch(response: Response) {
+impl Domain {
+    fn set_http_site(&mut self, site: Site) {
+        self.http = Some(site);
+        self.success = true;
+    }
+
+    fn set_https_site(&mut self, site: Site) {
+        self.https = Some(site);
+        self.success = true;
+    }
+}
+
+impl Display for Domain {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.url.is_empty() {
+            writeln!(f, "url:")?;
+        } else {
+            writeln!(f, "url: {}", self.url)?;
+        }
+
+        writeln!(f, "http:")?;
+        if let Some(ref http) = self.http {
+            writeln!(f, "    url: {}", http.url)?;
+            write!(f, "    title: ")?;
+            if let Some(ref title) = http.title {
+                writeln!(f, "{}", title)?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "    charset: ")?;
+            if let Some(ref charset) = http.charset {
+                writeln!(f, "{}", charset)?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "    description: ")?;
+            if let Some(ref desc) = http.description {
+                writeln!(f, "{}", desc)?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "    keywords: ")?;
+            if let Some(ref keywords) = http.keywords {
+                writeln!(f, "{}", keywords)?;
+            } else {
+                writeln!(f)?;
+            }
+        }
+
+        writeln!(f, "https:")?;
+        if let Some(ref https) = self.https {
+            writeln!(f, "    url: {}", https.url)?;
+            write!(f, "    title: ")?;
+            if let Some(ref title) = https.title {
+                writeln!(f, "{}", title)?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "    charset: ")?;
+            if let Some(ref charset) = https.charset {
+                writeln!(f, "{}", charset)?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "    description: ")?;
+            if let Some(ref desc) = https.description {
+                writeln!(f, "{}", desc)?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "    keywords: ")?;
+            if let Some(ref keywords) = https.keywords {
+                writeln!(f, "{}", keywords)?;
+            } else {
+                writeln!(f)?;
+            }
+        }
+
+        writeln!(f, "lookup: {}", self.lookup)?;
+        writeln!(f, "success: {}", self.success)
+    }
+}
+
+async fn dispatch(response: Response) -> Option<Site> {
+    let url = response.url().to_string();
     match response.status() {
         StatusCode::OK => {
             if let Ok(text) = response.text().await {
                 let doc = Html::parse_document(&text);
                 let mut site = parse_metadata(&doc);
+
+                site.url = url;
                 site.title = parse_title(&doc);
 
-                info!("{:?}", site);
+                Some(site)
+            } else {
+                None
             }
-        },
-        _ => warn!("Get response with code: {}", response.status().as_u16()),
-        // code if code >= StatusCode::MULTIPLE_CHOICES && code < StatusCode::BAD_REQUEST => {
-        //     let location = response.headers().get("Location").unwrap();
-        //     info!("Redirect: {} {}", code, location.to_str().unwrap());
-        // },
-        // code if code >= StatusCode::BAD_REQUEST && code < StatusCode::INTERNAL_SERVER_ERROR => {
-        //     info!("Client side error: {}", code);
-        // },
-        // code if code >= StatusCode::INTERNAL_SERVER_ERROR && code <= StatusCode::NETWORK_AUTHENTICATION_REQUIRED => {
-        //     info!("Server side error: {}", code);
-        // },
-        // code => {
-        //     info!("Information: {}", code);
-        // }
+        }
+        _ => {
+            warn!(
+                "{} -- Get response with code: {}",
+                url,
+                response.status().as_u16()
+            );
+            None
+        }
     }
 }
 
-type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-fn error_dispatch(proto: &str, err: reqwest::Error) {
+fn error_dispatch(domain: &str, err: reqwest::Error) {
     if err.is_request() {
-        error!("{} -- FAILED -- Error sending request", proto);
+        error!("{} -- FAILED -- Error sending request", domain);
     }
 
     if err.is_timeout() {
-        error!("{} -- FAILED -- Time out", proto);
+        error!("{} -- FAILED -- Time out", domain);
     }
 
     if err.is_status() {
-        error!("{} -- FAILED -- Http {} error", proto, err.status().unwrap().as_u16());
+        error!(
+            "{} -- FAILED -- Http {} error",
+            domain,
+            err.status().unwrap().as_u16()
+        );
     }
 }
 
-fn lookup_domain(proto: &str, domain: &Domain) {
-    info!("Look up domain {}\n{:#?}", &format!("{}/{}", proto, domain.url), domain);
-}
+async fn lookup_site(client: reqwest::Client, proto: &str, url: String) -> Option<Site> {
+    let url = format!("{}{}", proto, url);
+    let request = client.get(&url).build().unwrap();
 
-async fn batch_requests(coll: Collection) {
-    const BATCH_SIZE: usize = 10; // Не более 10 запросов в секунду
-    let timer = tokio::time::delay_for(Duration::from_secs(1));
-
-    let records = coll.find(None, None).await;
-
-    match records {
-        Ok(cursor) => {
-            cursor.take(BATCH_SIZE)
-                .filter_map(|x| {
-                    async { x.ok() }
-                })
-                .filter_map(|doc: Document| {
-                    async move {
-                        bson::from_bson::<Domain>(bson::Bson::Document(doc)).ok()
-                    }
-                })
-                .for_each(|domain| {
-                    async move {
-                        //info!("Connect to '{}' server ...", domain.url);
-                        let http = "http://";
-                        let https = "https://";
-
-                        lookup_domain(http, &domain);
-                        lookup_domain(https, &domain);
-                        // match reqwest::get(&format!("{}{}", http, &domain.url)).await {
-                        //     Ok(response) => dispatch(response).await,
-                        //     Err(err) => error_dispatch(http, err),
-                        // }
-                        //
-                        // match reqwest::get(&format!("{}{}", https, &domain.url)).await {
-                        //     Ok(response) => dispatch(response).await,
-                        //     Err(err) => error_dispatch(https, err),
-                        // }
-                    }
-                }).await;
-        }
+    match client.execute(request).await {
+        Ok(response) => dispatch(response).await,
         Err(err) => {
-            error!("{}", err);
+            error_dispatch(&url, err);
+            None
         }
     }
-
-    timer.await;
 }
+// async fn join_all<T>(mut handlers: Vec<T>)
+// where
+//     T: FusedFuture + Future + Unpin,
+// {
+//     loop {
+//         for handle in &mut handlers {
+//             handle.await;
+//         }
+//
+//         let remain = handlers.iter().filter(|x| !x.is_terminated()).count();
+//         if remain == 0 {
+//             break;
+//         }
+//     }
+// }
 
-async fn lookup_sites(client: mongodb::Client, db: &str) {
+async fn lookup_sites(client: mongodb::sync::Client, db: &str) {
+    let www = reqwest::ClientBuilder::default()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
     let db = client.database(db);
     let coll = db.collection("domains");
+    let options = FindOptions::builder().limit(Some(1)).build();
+    let filter = doc! {"lookup": {"$exists": false}, "removed": {"$exists": false}};
 
-    batch_requests(coll).await;
+    let mut db_errors: usize = 0;
+    loop {
+        let cursor = coll.find(filter.clone(), options.clone());
+
+        match cursor {
+            Ok(cursor) => {
+                let domain = cursor
+                    .filter_map(Result::ok)
+                    .filter_map(|doc: Document| {
+                        bson::from_bson::<Domain>(bson::Bson::Document(doc)).ok()
+                    })
+                    .next();
+
+                if let Some(mut domain) = domain {
+                    let timer = tokio::time::delay_for(Duration::from_millis(100));
+
+                    let http = tokio::spawn(lookup_site(www.clone(),HTTP, domain.url.clone()));
+                    let https = tokio::spawn(lookup_site(www.clone(),HTTPS, domain.url.clone()));
+
+                    let (http, https) = tokio::join!(http, https);
+                    timer.await; // Задержка на 100 мс, чтобы было не более 10 запросов в секунду.
+
+                    if let Ok(Some(site)) = http {
+                        domain.set_http_site(site);
+                    }
+
+                    if let Ok(Some(site)) = https {
+                        domain.set_https_site(site);
+                    }
+
+                    domain.lookup = true;
+
+                    if domain.success {
+                        info!("Look up domain {}\n{}", domain.url, domain);
+                    }
+
+                    let query = doc! {"url": &domain.url};
+                    let update = bson::to_document(&domain).unwrap();
+                    let result = coll.update_one(query, update, None);
+                    if let Err(err) = result {
+                        warn!("{}", err);
+                        db_errors += 1;
+                    }
+                }
+            }
+            Err(err) => {
+                error!("{}", err);
+                db_errors += 1;
+            }
+        }
+
+        if db_errors == 10 {
+            break;
+        }
+    }
 }
 
-#[tokio::main(core_threads=4)]
+#[tokio::main(core_threads = 4)]
 async fn main() -> BoxResult<()> {
     pretty_env_logger::init_timed();
 
-    let uri = std::env::var("MONGODB_URI").map_err(|x|{
+    let uri = std::env::var("MONGODB_URI").map_err(|x| {
         error!("You must set MONGODB_URI environment variable");
         x
     })?;
-    let client = mongodb::Client::with_uri_str(&uri).await?;
+    let client = mongodb::sync::Client::with_uri_str(&uri)?;
 
     let ru = tokio::spawn(lookup_sites(client.clone(), "ru_zone"));
     let su = tokio::spawn(lookup_sites(client.clone(), "su_zone"));
     let rf = tokio::spawn(lookup_sites(client.clone(), "rf_zone"));
 
-    let (r1, r2, r3) = tokio::join!(ru, su, rf);
+    let (ru, su, rf) = tokio::join!(ru, su, rf);
+    let _ = ru?;
+    let _ = su?;
+    let _ = rf?;
 
     Ok(())
 }

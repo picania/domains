@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Site {
+    pub url: String,
     pub title: Option<String>,
     pub charset: Option<String>,
     pub description: Option<String>,
@@ -17,8 +18,7 @@ pub fn parse_title(doc: &Html) -> Option<String> {
         .map(|x| {
             x.text().collect::<String>()
         })
-        .filter(|s| !s.is_empty())
-        .next()
+        .find(|s| !s.is_empty())
 }
 
 pub fn parse_metadata(doc: &Html) -> Site {
@@ -27,7 +27,7 @@ pub fn parse_metadata(doc: &Html) -> Site {
 
     for tag in doc.select(&meta) {
         if let Some(charset) = tag.value().attr("charset") {
-            metadata.charset = Some(charset.into());
+            metadata.charset = Some(charset.to_lowercase());
         }
 
         if let Some(name) = tag.value().attr("name") {
@@ -87,8 +87,9 @@ mod test {
     fn empty_title() {
         let html = r#"
         <html>
-            <head/>
-                <title/>
+            <head>
+                <title></title>
+            </head>
             <body/>
         </html>
         "#;
