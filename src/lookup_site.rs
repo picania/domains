@@ -18,7 +18,8 @@ type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // 1. Берем из базы 1 доменное имя без поля "lookup".
 // 2. Стучимся по адресу по протоколам http и https.
-// 3. По каждому протоколу записываем ответ: url, title, charset, description, keywords.
+// 3. По каждому протоколу записываем ответ: url, title, charset, description, keywords. Url может
+//    отличаться от первоначального, если было перенаправление.
 // 4. Сохраняем полученную информацию с отметкой lookup: true, success: true.
 // 5. Если веб сервера на доменном имени нет, то отмечаем в базе lookup: true, success: false.
 
@@ -176,21 +177,6 @@ async fn lookup_site(client: reqwest::Client, proto: &str, url: String) -> Optio
         }
     }
 }
-// async fn join_all<T>(mut handlers: Vec<T>)
-// where
-//     T: FusedFuture + Future + Unpin,
-// {
-//     loop {
-//         for handle in &mut handlers {
-//             handle.await;
-//         }
-//
-//         let remain = handlers.iter().filter(|x| !x.is_terminated()).count();
-//         if remain == 0 {
-//             break;
-//         }
-//     }
-// }
 
 async fn lookup_sites(client: mongodb::sync::Client, db: &str) {
     let www = reqwest::ClientBuilder::default()
@@ -207,6 +193,7 @@ async fn lookup_sites(client: mongodb::sync::Client, db: &str) {
     let mut db_errors: usize = 0;
     loop {
         let cursor = coll.find(filter.clone(), options.clone());
+        let mut records: usize = 0;
 
         match cursor {
             Ok(cursor) => {
@@ -235,6 +222,7 @@ async fn lookup_sites(client: mongodb::sync::Client, db: &str) {
                     }
 
                     domain.lookup = true;
+                    records += 1;
 
                     if domain.success {
                         info!("Look up domain {}\n{}", domain.url, domain);
@@ -255,7 +243,8 @@ async fn lookup_sites(client: mongodb::sync::Client, db: &str) {
             }
         }
 
-        if db_errors == 10 {
+        // Если что-то случилось с БД или кончились записи.
+        if db_errors == 10 || records == 0 {
             break;
         }
     }
